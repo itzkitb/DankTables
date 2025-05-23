@@ -14,447 +14,269 @@ namespace Dank
     public static class DankTable
     {
         private const string NaM = "/NaM/";
-        private static readonly object fileLock = new object();
-        private static readonly LruCache<string, CacheItem> _cache = new LruCache<string, CacheItem>(100);
+        private static readonly LruCache<string, TableData> cache = new LruCache<string, TableData>(100);
+        private static string version = "1.0";
+        public const string libVersion = "1.0.1";
+        private static List<string> suportedVersion = new() { "1.0" };
+
+        private class TableData
+        {
+            public Dictionary<string, string> Settings { get; set; } = new();
+            public List<string> Rows { get; set; } = new();
+            public List<Dictionary<string, object>> Lines { get; set; } = new();
+        }
 
         public static void CreateDatabase(string path, List<string> rows, string mainRow)
         {
-            var settings = new TableSettings
-            {
-                KeyRow = mainRow,
-                Separator = "|",
-                DankVersion = "1.0"
-            };
+            if (!rows.Contains(mainRow))
+                throw new ArgumentException("Main row must be in rows list");
 
             foreach (var row in rows)
             {
-                if (!Regex.IsMatch(row, @"^[a-zA-Z_][a-zA-Z0-9_]*$"))
-                    throw new ArgumentException($"Row '{row}' is invalid. Row names must be in English.");
+                if (!Regex.IsMatch(row, @"^[a-zA-Z]+$"))
+                    throw new ArgumentException($"Row name '{row}' contains non-English characters");
             }
 
-            string settingsLine = $"KeyRow:{settings.KeyRow};Separator:{settings.Separator};DankVersion:{settings.DankVersion};";
-            string headersLine = string.Join(settings.Separator, rows);
+            var settings = $"KeyRow:{mainRow};Separator:|;DankVersion:{version};";
+            var header = string.Join("|", rows);
 
-            using (var writer = new StreamWriter(path))
-            {
-                writer.WriteLine(settingsLine);
-                writer.WriteLine(headersLine);
-            }
+            File.WriteAllLines(path, new[] { settings, header });
+            cache.Invalidate(path);
         }
 
         public static void AddRow(string path, string row)
         {
-            var settings = ReadSettings(path);
-            var headers = ReadHeaders(path, settings.Separator);
-            var parts = row.Split(new[] { settings.Separator }, StringSplitOptions.None);
-            if (parts.Length != headers.Count)
-                throw new ArgumentException("Row does not match headers count.");
+            if (!Regex.IsMatch(row, @"^[a-zA-Z]+$"))
+                throw new ArgumentException("Row name must be in English");
 
-            lock (fileLock)
+            var table = LoadTable(path);
+
+            if (table.Rows.Contains(row))
+                throw new ArgumentException("Row already exists");
+
+            table.Rows.Add(row);
+
+            foreach (var line in table.Lines)
             {
-                File.AppendAllText(path, row + Environment.NewLine);
+                if (!line.ContainsKey(row))
+                    line[row] = NaM;
             }
+
+            SaveTable(path, table);
         }
 
         public static void AddRows(string path, List<string> rows)
         {
             foreach (var row in rows)
-            {
                 AddRow(path, row);
-            }
         }
 
         public static void RemoveRow(string path, string row)
         {
-            var settings = ReadSettings(path);
-            var tempPath = Path.GetTempFileName();
-            using (var reader = new StreamReader(path))
-            using (var writer = new StreamWriter(tempPath))
-            {
-                string line;
-                while ((line = reader.ReadLine()) != null)
-                {
-                    if (line != row)
-                    {
-                        writer.WriteLine(line);
-                    }
-                }
-            }
+            var table = LoadTable(path);
+            var keyRow = table.Settings["KeyRow"];
 
-            File.Delete(path);
-            File.Move(tempPath, path);
-            _cache.Clear();
+            if (row == keyRow)
+                throw new ArgumentException("Cannot remove key row");
+
+            if (!table.Rows.Remove(row))
+                throw new ArgumentException("Row does not exist");
+
+            foreach (var line in table.Lines)
+                line.Remove(row);
+
+            SaveTable(path, table);
         }
 
         public static void RemoveRows(string path, List<string> rows)
         {
             foreach (var row in rows)
-            {
                 RemoveRow(path, row);
-            }
         }
 
         public static void AddLine(string path, Dictionary<string, object> data)
         {
-            var settings = ReadSettings(path);
-            var headers = ReadHeaders(path, settings.Separator);
+            var table = LoadTable(path);
+            var keyRow = table.Settings["KeyRow"];
 
-            if (settings.KeyRow != null && !data.ContainsKey(settings.KeyRow))
-            {
-                string newId = GenerateNextId(path, settings);
-                data[settings.KeyRow] = newId;
-            }
+            if (!data.ContainsKey(keyRow))
+                throw new ArgumentException($"Data must contain key row '{keyRow}'");
 
-            List<string> encodedValues = new List<string>();
-            foreach (var header in headers)
+            var newLine = new Dictionary<string, object>();
+            foreach (var row in table.Rows)
             {
-                if (data.TryGetValue(header, out var value))
-                {
-                    string json = JsonSerializer.Serialize(value, value.GetType(), new JsonSerializerOptions { WriteIndented = false });
-                    string encoded = Convert.ToBase64String(Encoding.UTF8.GetBytes(json));
-                    encodedValues.Add(encoded);
-                }
+                if (data.TryGetValue(row, out var value))
+                    newLine[row] = value;
                 else
-                {
-                    encodedValues.Add(NaM);
-                }
+                    newLine[row] = NaM;
             }
 
-            string line = string.Join(settings.Separator, encodedValues);
-
-            lock (fileLock)
-            {
-                File.AppendAllText(path, line + Environment.NewLine);
-            }
-
-            string id = data[settings.KeyRow].ToString();
-            var cacheItem = new CacheItem
-            {
-                data = new Dictionary<string, JsonElement>(),
-                last_modified = DateTime.Now
-            };
-            foreach (var kvp in data)
-            {
-                string json = JsonSerializer.Serialize(kvp.Value, kvp.Value.GetType(), new JsonSerializerOptions { WriteIndented = false });
-                using var doc = JsonDocument.Parse(json);
-                cacheItem.data[kvp.Key] = doc.RootElement.Clone();
-            }
-            _cache.AddOrUpdate($"{path}#{id}", cacheItem);
+            table.Lines.Add(newLine);
+            SaveTable(path, table);
         }
 
         public static void RemoveLine(string path, object id)
         {
-            string idStr = id.ToString();
-            var settings = ReadSettings(path);
-            var tempPath = Path.GetTempFileName();
-            using (var reader = new StreamReader(path))
-            using (var writer = new StreamWriter(tempPath))
+            var table = LoadTable(path);
+            var keyRow = table.Settings["KeyRow"];
+
+            var lineToRemove = table.Lines.FirstOrDefault(l =>
+                l[keyRow]?.ToString() == id.ToString());
+
+            if (lineToRemove != null)
             {
-                writer.WriteLine(reader.ReadLine()); // Settings line
-                writer.WriteLine(reader.ReadLine()); // Headers line
-
-                string line;
-                while ((line = reader.ReadLine()) != null)
-                {
-                    var parts = line.Split(settings.Separator);
-                    string encodedId = parts[0];
-                    string decodedId = DecodeBase64(encodedId);
-                    if (decodedId != idStr)
-                    {
-                        writer.WriteLine(line);
-                    }
-                }
+                table.Lines.Remove(lineToRemove);
+                SaveTable(path, table);
             }
-
-            File.Delete(path);
-            File.Move(tempPath, path);
-            _cache.Invalidate($"{path}#{idStr}");
         }
 
         public static void EditData(string path, object line, string row, object data)
         {
-            string idStr = line.ToString();
-            var settings = ReadSettings(path);
-            var headers = ReadHeaders(path, settings.Separator);
-            int rowIndex = headers.IndexOf(row);
-            if (rowIndex == -1)
-                throw new ArgumentException($"Row '{row}' not found.");
+            var table = LoadTable(path);
+            var keyRow = table.Settings["KeyRow"];
 
-            string json = JsonSerializer.Serialize(data, data.GetType(), new JsonSerializerOptions { WriteIndented = false });
-            string encoded = Convert.ToBase64String(Encoding.UTF8.GetBytes(json));
+            var targetLine = table.Lines.FirstOrDefault(l =>
+                l[keyRow]?.ToString() == line.ToString());
 
-            var tempPath = Path.GetTempFileName();
-            using (var reader = new StreamReader(path))
-            using (var writer = new StreamWriter(tempPath))
-            {
-                writer.WriteLine(reader.ReadLine()); // Settings line
-                writer.WriteLine(reader.ReadLine()); // Headers line
+            if (targetLine == null)
+                throw new ArgumentException("Line not found");
 
-                string fileLine;
-                while ((fileLine = reader.ReadLine()) != null)
-                {
-                    var parts = fileLine.Split(settings.Separator);
-                    string encodedId = parts[0];
-                    string decodedId = DecodeBase64(encodedId);
-                    if (decodedId == idStr)
-                    {
-                        parts[rowIndex] = encoded;
-                        fileLine = string.Join(settings.Separator, parts);
-                    }
-                    writer.WriteLine(fileLine);
-                }
-            }
+            if (!table.Rows.Contains(row))
+                throw new ArgumentException($"Row '{row}' does not exist");
 
-            File.Delete(path);
-            File.Move(tempPath, path);
-
-            var cacheKey = $"{path}#{idStr}";
-            if (_cache.TryGet(cacheKey, out var cachedItem))
-            {
-                using var doc = JsonDocument.Parse(json);
-                cachedItem.data[row] = doc.RootElement.Clone();
-                cachedItem.last_modified = DateTime.Now;
-                _cache.AddOrUpdate(cacheKey, cachedItem);
-            }
+            targetLine[row] = data;
+            SaveTable(path, table);
         }
 
         public static T GetData<T>(string path, object line, string row)
         {
-            string idStr = line.ToString();
-            var cacheKey = $"{path}#{idStr}";
+            var table = LoadTable(path);
+            var keyRow = table.Settings["KeyRow"];
 
-            if (_cache.TryGet(cacheKey, out var cachedItem))
-            {
-                if (cachedItem.data.TryGetValue(row, out var element))
-                {
-                    if (IsNaM(element))
-                        return default;
-                    return element.Deserialize<T>(new JsonSerializerOptions { WriteIndented = false });
-                }
-            }
+            var targetLine = table.Lines.FirstOrDefault(l =>
+                l[keyRow]?.ToString() == line.ToString());
 
-            var settings = ReadSettings(path);
-            var headers = ReadHeaders(path, settings.Separator);
-            var data = new Dictionary<string, JsonElement>();
-            bool found = false;
-
-            using (var reader = new StreamReader(path))
-            {
-                reader.ReadLine(); // Skip settings
-                reader.ReadLine(); // Skip headers
-
-                string fileLine;
-                while ((fileLine = reader.ReadLine()) != null)
-                {
-                    var parts = fileLine.Split(settings.Separator);
-                    string encodedId = parts[0];
-                    string decodedId = DecodeBase64(encodedId);
-                    if (decodedId == idStr)
-                    {
-                        found = true;
-                        for (int i = 0; i < headers.Count; i++)
-                        {
-                            string header = headers[i];
-                            string encodedValue = parts[i];
-                            string decodedValue = DecodeBase64(encodedValue);
-                            if (decodedValue == NaM)
-                            {
-                                data[header] = default;
-                                continue;
-                            }
-
-                            try
-                            {
-                                using var doc = JsonDocument.Parse(decodedValue);
-                                data[header] = doc.RootElement.Clone();
-                            }
-                            catch
-                            {
-                                data[header] = default;
-                            }
-                        }
-                        break;
-                    }
-                }
-            }
-
-            if (!found)
+            if (targetLine == null || !targetLine.TryGetValue(row, out var value))
                 return default;
 
-            var cacheItem = new CacheItem
-            {
-                data = new Dictionary<string, JsonElement>(data),
-                last_modified = DateTime.Now
-            };
-            _cache.AddOrUpdate(cacheKey, cacheItem);
+            if (value is null || value.ToString() == NaM)
+                return default;
 
-            if (data.TryGetValue(row, out var elem))
+            try
             {
-                if (IsNaM(elem))
-                    return default;
-                return elem.Deserialize<T>(new JsonSerializerOptions { WriteIndented = false });
+                return (T)value;
             }
-            return default;
+            catch
+            {
+                return JsonSerializer.Deserialize<T>(JsonSerializer.SerializeToElement(value));
+            }
         }
 
         public static Dictionary<string, object> GetData(string path, object line)
         {
-            string idStr = line.ToString();
-            var cacheKey = $"{path}#{idStr}";
+            var table = LoadTable(path);
+            var keyRow = table.Settings["KeyRow"];
 
-            if (_cache.TryGet(cacheKey, out var cachedItem))
+            var targetLine = table.Lines.FirstOrDefault(l =>
+                l[keyRow]?.ToString() == line.ToString());
+
+            if (targetLine == null)
+                throw new ArgumentException("Line not found");
+
+            return new Dictionary<string, object>(targetLine);
+        }
+
+        public static Dictionary<object, Dictionary<string, object>> GetData(string path)
+        {
+            var table = LoadTable(path);
+            var keyRow = table.Settings["KeyRow"];
+
+            return table.Lines.ToDictionary(
+                l => l[keyRow],
+                l => new Dictionary<string, object>(l)
+            );
+        }
+
+        private static TableData LoadTable(string path)
+        {
+            if (cache.TryGet(path, out var table))
+                return table;
+
+            var lines = File.ReadAllLines(path);
+            var tableData = new TableData();
+
+            var settings = lines[0].Split(new[] { ';', ':' }, StringSplitOptions.RemoveEmptyEntries);
+            for (int i = 0; i < settings.Length; i += 2)
+                tableData.Settings[settings[i]] = settings[i + 1];
+
+            if (!suportedVersion.Contains(tableData.Settings["DankVersion"]))
+                throw new InvalidOperationException($"Unsupported version of DankTable. Current version: {version}. Supported versions: {string.Join(",", suportedVersion)}. File version: {tableData.Settings["DankVersion"]}. Library version: {libVersion}. Try updating the library to the latest version.");
+
+            char Separator = tableData.Settings["Separator"] is not null ? tableData.Settings["Separator"].ToArray()[0] : '|';
+
+            tableData.Rows = lines[1].Split(Separator).ToList();
+            foreach (var row in tableData.Rows)
             {
-                var result = new Dictionary<string, object>();
-                foreach (var kvp in cachedItem.data)
-                {
-                    result[kvp.Key] = kvp.Value.Deserialize<object>(new JsonSerializerOptions { WriteIndented = false });
-                }
-                return result;
+                if (!Regex.IsMatch(row, @"^[a-zA-Z]+$"))
+                    throw new ArgumentException($"Row name '{row}' contains non-English characters");
             }
 
-            var settings = ReadSettings(path);
-            var headers = ReadHeaders(path, settings.Separator);
-            var data = new Dictionary<string, object>();
-
-            using (var reader = new StreamReader(path))
+            for (int i = 2; i < lines.Length; i++)
             {
-                reader.ReadLine(); // Skip settings
-                reader.ReadLine(); // Skip headers
+                var cells = lines[i].Split(Separator);
+                var lineData = new Dictionary<string, object>();
 
-                string fileLine;
-                while ((fileLine = reader.ReadLine()) != null)
+                for (int j = 0; j < cells.Length && j < tableData.Rows.Count; j++)
                 {
-                    var parts = fileLine.Split(settings.Separator);
-                    string encodedId = parts[0];
-                    string decodedId = DecodeBase64(encodedId);
-                    if (decodedId == idStr)
-                    {
-                        for (int i = 0; i < headers.Count; i++)
-                        {
-                            string header = headers[i];
-                            string encodedValue = parts[i];
-                            string decodedValue = DecodeBase64(encodedValue);
-                            if (decodedValue == NaM)
-                            {
-                                data[header] = null;
-                                continue;
-                            }
-
-                            try
-                            {
-                                using var doc = JsonDocument.Parse(decodedValue);
-                                var value = doc.RootElement.Deserialize<object>(new JsonSerializerOptions { WriteIndented = false });
-                                data[header] = value;
-                            }
-                            catch
-                            {
-                                data[header] = null;
-                            }
-                        }
-                        break;
-                    }
+                    var decoded = Encoding.UTF8.GetString(Convert.FromBase64String(cells[j]));
+                    if (decoded == NaM)
+                        lineData[tableData.Rows[j]] = NaM;
+                    else
+                        lineData[tableData.Rows[j]] = JsonSerializer.Deserialize<object>(decoded);
                 }
+
+                tableData.Lines.Add(lineData);
             }
 
-            var newCacheItem = new CacheItem
+            cache.AddOrUpdate(path, tableData);
+            return tableData;
+        }
+
+        private static void SaveTable(string path, TableData table)
+        {
+            var outputLines = new List<string>
             {
-                data = new Dictionary<string, JsonElement>(),
-                last_modified = DateTime.Now
+                $"KeyRow:{table.Settings["KeyRow"]};Separator:|;DankVersion:{version};",
+                string.Join("|", table.Rows)
             };
-            foreach (var kvp in data)
+
+            foreach (var line in table.Lines)
             {
-                string json = JsonSerializer.Serialize(kvp.Value, new JsonSerializerOptions { WriteIndented = false });
-                using var doc = JsonDocument.Parse(json);
-                newCacheItem.data[kvp.Key] = doc.RootElement.Clone();
-            }
-            _cache.AddOrUpdate(cacheKey, newCacheItem);
-
-            return data;
-        }
-
-        private static string GenerateNextId(string path, TableSettings settings)
-        {
-            int maxId = 0;
-            using (var reader = new StreamReader(path))
-            {
-                reader.ReadLine(); // Skip settings
-                reader.ReadLine(); // Skip headers
-
-                string line;
-                while ((line = reader.ReadLine()) != null)
+                var cells = new List<string>();
+                foreach (var row in table.Rows)
                 {
-                    var parts = line.Split(settings.Separator);
-                    string encodedId = parts[0];
-                    string decodedId = DecodeBase64(encodedId);
-                    if (int.TryParse(decodedId, out int id))
+                    if (line.TryGetValue(row, out var value))
                     {
-                        if (id > maxId)
-                            maxId = id;
+                        if (value.ToString() == NaM)
+                        {
+                            cells.Add(Convert.ToBase64String(Encoding.UTF8.GetBytes(NaM)));
+                        }
+                        else
+                        {
+                            var json = JsonSerializer.Serialize(value);
+                            cells.Add(Convert.ToBase64String(Encoding.UTF8.GetBytes(json)));
+                        }
+                    }
+                    else
+                    {
+                        cells.Add(Convert.ToBase64String(Encoding.UTF8.GetBytes(NaM)));
                     }
                 }
+                outputLines.Add(string.Join("|", cells));
             }
-            int nextId = maxId + 1;
-            return Convert.ToBase64String(Encoding.UTF8.GetBytes(nextId.ToString()));
-        }
 
-        private static TableSettings ReadSettings(string path)
-        {
-            string firstLine = File.ReadLines(path).First();
-            var settings = new TableSettings();
-            foreach (var part in firstLine.Split(';'))
-            {
-                var keyValue = part.Split(':');
-                if (keyValue.Length == 2)
-                {
-                    switch (keyValue[0])
-                    {
-                        case "KeyRow":
-                            settings.KeyRow = keyValue[1];
-                            break;
-                        case "Separator":
-                            settings.Separator = keyValue[1];
-                            break;
-                        case "DankVersion":
-                            settings.DankVersion = keyValue[1];
-                            break;
-                    }
-                }
-            }
-            return settings;
-        }
-
-        private static List<string> ReadHeaders(string path, string separator)
-        {
-            var lines = File.ReadLines(path);
-            var secondLine = lines.Skip(1).First();
-            return secondLine.Split(new[] { separator }, StringSplitOptions.None).ToList();
-        }
-
-        private static string DecodeBase64(string encoded)
-        {
-            if (encoded == NaM)
-                return NaM;
-            try
-            {
-                byte[] data = Convert.FromBase64String(encoded);
-                return Encoding.UTF8.GetString(data);
-            }
-            catch
-            {
-                return NaM;
-            }
-        }
-
-        private static bool IsNaM(JsonElement element)
-        {
-            return element.ValueKind == JsonValueKind.String && element.GetString() == NaM;
-        }
-
-        private class TableSettings
-        {
-            public string KeyRow { get; set; }
-            public string Separator { get; set; }
-            public string DankVersion { get; set; }
+            File.WriteAllLines(path, outputLines);
+            cache.AddOrUpdate(path, table);
         }
     }
 
@@ -603,6 +425,11 @@ namespace Dank
                     lru.RemoveLast();
                 }
             }
+        }
+
+        public IEnumerable<TKey> GetKeys()
+        {
+            return cache.Keys;
         }
 
         private sealed class LruCacheItem
